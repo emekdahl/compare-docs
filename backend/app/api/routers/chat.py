@@ -1,13 +1,16 @@
-from typing import List
+from typing import List, cast
 
 from fastapi.responses import StreamingResponse
 
+from threading import Thread
 from app.utils.json import json_to_model
-from app.utils.index import get_index
+from app.utils.index import get_agent
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from llama_index import VectorStoreIndex
 from llama_index.llms.base import MessageRole, ChatMessage
+from llama_index.agent import OpenAIAgent
+from llama_index.chat_engine.types import StreamingAgentChatResponse
 from pydantic import BaseModel
+import logging
 
 chat_router = r = APIRouter()
 
@@ -27,8 +30,9 @@ async def chat(
     # Note: To support clients sending a JSON object using content-type "text/plain",
     # we need to use Depends(json_to_model(_ChatData)) here
     data: _ChatData = Depends(json_to_model(_ChatData)),
-    index: VectorStoreIndex = Depends(get_index),
+    agent: OpenAIAgent = Depends(get_agent),
 ):
+    logger = logging.getLogger("uvicorn")
     # check preconditions and get last message
     if len(data.messages) == 0:
         raise HTTPException(
@@ -50,16 +54,32 @@ async def chat(
         for m in data.messages
     ]
 
-    # query chat engine
-    chat_engine = index.as_chat_engine()
-    response = chat_engine.stream_chat(lastMessage.content, messages)
+    # start a new thread here to query chat engine
+    thread = Thread(target=agent.stream_chat, args=(lastMessage.content, messages))
+    thread.start()
+    logger.info("Querying chat engine")
+    # response = agent.stream_chat(lastMessage.content, messages)
 
     # stream response
-    async def event_generator():
-        for token in response.response_gen:
-            # If client closes connection, stop sending events
-            if await request.is_disconnected():
-                break
-            yield token
+    # NOTE: changed to sync due to issues with blocking the event loop
+    # see https://stackoverflow.com/a/75760884
+    def event_generator():
+        queue = agent.callback_manager.handlers[0].queue
 
-    return StreamingResponse(event_generator(), media_type="text/plain")
+        # stream response
+        while True:
+            next_item = queue.get(True, 60.0)  # set a generous timeout of 60 seconds
+            # check type of next_item, if string or not
+            if isinstance(next_item, str):
+                yield next_item
+            elif isinstance(next_item, StreamingAgentChatResponse):
+                response = cast(StreamingAgentChatResponse, next_item)
+                for token in response.response_gen:
+                    yield token
+                # if not string, then it is the end of the stream
+                break
+            else:
+                # stringify
+                yield str(next_item)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

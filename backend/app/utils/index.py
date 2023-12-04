@@ -135,7 +135,7 @@ def _download_data(out_dir: str, wiki_titles: List[str]) -> None:
             if not data_path.exists():
                 Path.mkdir(data_path)
 
-            with open(data_path / f"{title}.txt", "w") as fp:
+            with open(data_path / f"{title}.txt", "w", encoding='utf-8') as fp:
                 fp.write(wiki_text)
         else:
             pass
